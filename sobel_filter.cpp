@@ -38,7 +38,6 @@ int main(int argc, char* argv[]) {
 		
 		Mat edges = to442_sobel(gray);
 		
-		imshow("Grayscale", gray);
 		imshow("Sobel", edges);	
 
 		if(waitKey(1) == 27) break; //ESC to quit
@@ -135,7 +134,7 @@ cv::Mat to442_sobel(const cv::Mat& image) {
             int magnitude = std::abs(gx) + std::abs(gy);
 
             // Clamp to 8-bit
-            if (magnitude > 255) magnitude = 255;
+            if (magnitude > (1<<8)) magnitude = 1<<8;
 
             filtered_image.at<uint8_t>(y, x) = (uint8_t)magnitude;
         }
