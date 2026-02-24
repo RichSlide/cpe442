@@ -161,9 +161,13 @@ void toGrayscale(ThreadArgs* thread) {
             uint8x8x3_t bgr = vld3_u8(p);
 
             // Widen and multiply: (B*WB + G*WG + R*WR)
-            uint16x8_t acc = vmull_n_u8(bgr.val[0], WB);
-            acc = vmlal_n_u8(acc, bgr.val[1], WG);
-            acc = vmlal_n_u8(acc, bgr.val[2], WR);
+            uint8x8_t wb = vdup_n_u8(WB);
+            uint8x8_t wg = vdup_n_u8(WG);
+            uint8x8_t wr = vdup_n_u8(WR);
+            
+            uint16x8_t acc = vmull_u8(bgr.val[0], wb);
+            acc = vmlal_u8(acc, bgr.val[1], wg);
+            acc = vmlal_u8(acc, bgr.val[2], wr);
 
             // Add rounding offset then shift down by 8
             acc = vaddq_u16(acc, vdupq_n_u16(128));
@@ -246,9 +250,19 @@ void toSobel(ThreadArgs* thread) {
             uint8x8_t br = vget_low_u8(vextq_u8(t2, t2, 2));
 
             // Gx = (tr - tl) + 2*(mr - ml) + (br - bl)
-            int16x8_t dx_top = vsubl_u8(tr, tl);
-            int16x8_t dx_mid = vsubl_u8(mr, ml);
-            int16x8_t dx_bot = vsubl_u8(br, bl);
+            // Widen to int16 (values 0..255) then subtract signed => result in [-255, 255]
+            int16x8_t tl_s = vreinterpretq_s16_u16(vmovl_u8(tl));
+            int16x8_t tr_s = vreinterpretq_s16_u16(vmovl_u8(tr));
+            int16x8_t ml_s = vreinterpretq_s16_u16(vmovl_u8(ml));
+            int16x8_t mr_s = vreinterpretq_s16_u16(vmovl_u8(mr));
+            int16x8_t bl_s = vreinterpretq_s16_u16(vmovl_u8(bl));
+            int16x8_t br_s = vreinterpretq_s16_u16(vmovl_u8(br));
+            
+            int16x8_t dx_top = vsubq_s16(tr_s, tl_s);
+            int16x8_t dx_mid = vsubq_s16(mr_s, ml_s);
+            int16x8_t dx_bot = vsubq_s16(br_s, bl_s);
+            
+            int16x8_t gx = vaddq_s16(vaddq_s16(dx_top, vshlq_n_s16(dx_mid, 1)), dx_bot);
 
             int16x8_t gx = vaddq_s16(vaddq_s16(dx_top, vshlq_n_s16(dx_mid, 1)), dx_bot);
 
@@ -261,16 +275,20 @@ void toSobel(ThreadArgs* thread) {
             uint16x8_t bc16 = vmovl_u8(bc);
             uint16x8_t br16 = vmovl_u8(br);
 
-            uint16x8_t top = vaddq_u16(vaddq_u16(tl16, tr16), vshlq_n_u16(tc16, 1));
-            uint16x8_t bot = vaddq_u16(vaddq_u16(bl16, br16), vshlq_n_u16(bc16, 1));
-
-            int16x8_t gy = vsubq_s16(vreinterpretq_s16_u16(top),
-                                     vreinterpretq_s16_u16(bot));
+            int16x8_t tc_s = vreinterpretq_s16_u16(vmovl_u8(tc));
+            int16x8_t bc_s = vreinterpretq_s16_u16(vmovl_u8(bc));
+            
+            int16x8_t top = vaddq_s16(vaddq_s16(tl_s, tr_s), vshlq_n_s16(tc_s, 1));
+            int16x8_t bot = vaddq_s16(vaddq_s16(bl_s, br_s), vshlq_n_s16(bc_s, 1));
+            
+            int16x8_t gy = vsubq_s16(top, bot);
 
             // magnitude = abs(gx) + abs(gy), saturated to 255
             uint16x8_t ax = vreinterpretq_u16_s16(vabsq_s16(gx));
             uint16x8_t ay = vreinterpretq_u16_s16(vabsq_s16(gy));
             uint16x8_t mag = vqaddq_u16(ax, ay);
+            uint8x8_t out = vqmovn_u16(mag);
+            vst1_u8(outRow + x, out);;
 
             // Narrow with saturation to u8
             uint8x8_t out = vqmovn_u16(mag);
