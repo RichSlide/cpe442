@@ -85,8 +85,7 @@ int main(int argc, char* argv[]) {
     }
 
     while (running) {
-        imshow("Original", frame);
-        imshow("Grayscale", gray);
+
         imshow("Sobel", sobel);
 
         if (waitKey(30) == 27) { // ESC
