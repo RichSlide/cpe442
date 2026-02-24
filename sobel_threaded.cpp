@@ -262,7 +262,7 @@ void toSobel(ThreadArgs* thread) {
             int16x8_t dx_mid = vsubq_s16(mr_s, ml_s);
             int16x8_t dx_bot = vsubq_s16(br_s, bl_s);
             
-            int16x8_t gx = vaddq_s16(vaddq_s16(dx_top, vshlq_n_s16(dx_mid, 1)), dx_bot);
+        
 
             int16x8_t gx = vaddq_s16(vaddq_s16(dx_top, vshlq_n_s16(dx_mid, 1)), dx_bot);
 
@@ -290,10 +290,7 @@ void toSobel(ThreadArgs* thread) {
             uint8x8_t out = vqmovn_u16(mag);
             vst1_u8(outRow + x, out);;
 
-            // Narrow with saturation to u8
-            uint8x8_t out = vqmovn_u16(mag);
-
-            vst1_u8(outRow + x, out);
+       
         }
 
         // Scalar tail for remaining interior pixels until cols-2
