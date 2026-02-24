@@ -2,37 +2,40 @@
 #include <iostream>
 #include <cstdint>
 #include <pthread.h>
+#include <algorithm>
+#include <cmath>
+#include <arm_neon.h>
 
 using namespace cv;
 using namespace std;
 
-const int khang_num_threads = 4;
+constexpr int NUM_THREADS = 4;
 
-struct KhangSharedFrame {
-    cv::Mat* khang_frame;
-    cv::Mat* khang_gray;
-    cv::Mat* khang_sobel;
-    
-    int khang_rows;
-    int khang_cols;
-    int khang_channels;
-    
-    pthread_barrier_t* khang_barrier;
-    bool* khang_running;
-    
-    cv::VideoCapture* khang_cap;
+struct SharedFrame {
+    cv::Mat* frame;
+    cv::Mat* gray;
+    cv::Mat* sobel;
+
+    int rows;
+    int cols;
+    int channels;
+
+    pthread_barrier_t* barrier;
+    bool* running;
+
+    cv::VideoCapture* cap;
 };
 
-struct KhangThreadArgs {
-    KhangSharedFrame* khang_shared;
-    int khang_thread_id;
-    int khang_row_per_thread;
+struct ThreadArgs {
+    SharedFrame* shared;
+    int threadId;
+    int rowsPerThread;
 };
 
 // Forward declarations
-void* khang_worker(void* arg);
-void khang_to442_grayscale(KhangThreadArgs* khang_thread);
-void khang_to442_sobel(KhangThreadArgs* khang_thread);
+void* worker(void* arg);
+void toGrayscale(ThreadArgs* thread);
+void toSobel(ThreadArgs* thread);
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -40,173 +43,255 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    cv::VideoCapture khang_cap(argv[1]);
-    if (!khang_cap.isOpened()) {
-        std::cerr << "Error: Could not open video\n";
+    cv::VideoCapture cap(argv[1]);
+    if (!cap.isOpened()) {
+        cerr << "Error: Could not open video\n";
         return -1;
     }
 
-    cv::Mat khang_frame;
-    bool khang_success = khang_cap.read(khang_frame);
-    
-    if(!khang_success){
+    cv::Mat frame;
+    bool success = cap.read(frame);
+
+    if (!success) {
         cerr << "Error: Could not read first frame\n";
         return -1;
     }
 
-    int khang_rows = khang_frame.rows;
-    int khang_row_per_thread = (khang_rows + khang_num_threads - 1) / khang_num_threads; // round up
-    int khang_cols = khang_frame.cols;
-    int khang_channels = khang_frame.channels();
+    int rows = frame.rows;
+    int cols = frame.cols;
+    int channels = frame.channels();
+    int rowsPerThread = (rows + NUM_THREADS - 1) / NUM_THREADS; // round up
 
-    pthread_t khang_threads[khang_num_threads];
-    pthread_barrier_t khang_barrier;
-    pthread_barrier_init(&khang_barrier, nullptr, khang_num_threads); // Only worker threads
+    pthread_t threads[NUM_THREADS];
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, nullptr, NUM_THREADS); // only worker threads
 
-    cv::Mat khang_gray(khang_rows, khang_cols, CV_8UC1);  // Single channel for grayscale
-    cv::Mat khang_sobel(khang_rows, khang_cols, CV_8UC1);
-    bool khang_running = true;
+    cv::Mat gray(rows, cols, CV_8UC1);
+    cv::Mat sobel(rows, cols, CV_8UC1);
+    bool running = true;
 
-    KhangSharedFrame khang_shared = {&khang_frame, &khang_gray, &khang_sobel, khang_rows, khang_cols, khang_channels, &khang_barrier, &khang_running, &khang_cap};
+    SharedFrame shared = {
+        &frame, &gray, &sobel,
+        rows, cols, channels,
+        &barrier, &running,
+        &cap
+    };
 
-    KhangThreadArgs khang_thread_args[khang_num_threads];
-    
-    // Create threads
-    for (int khang_i = 0; khang_i < khang_num_threads; khang_i++) {
-        khang_thread_args[khang_i] = {&khang_shared, khang_i, khang_row_per_thread};
-        pthread_create(&khang_threads[khang_i], nullptr, khang_worker, &khang_thread_args[khang_i]);
+    ThreadArgs threadArgs[NUM_THREADS];
+
+    for (int i = 0; i < NUM_THREADS; i++) {
+        threadArgs[i] = { &shared, i, rowsPerThread };
+        pthread_create(&threads[i], nullptr, worker, &threadArgs[i]);
     }
 
-    // Main loop - just display and read frames
-    while(khang_running) {
-        // Display result
-        imshow("Original", khang_frame);
-        imshow("Grayscale", khang_gray);
-        imshow("Sobel", khang_sobel);
-        
-        if(waitKey(30) == 27) { // ESC to quit
-            khang_running = false;
+    while (running) {
+        imshow("Original", frame);
+        imshow("Grayscale", gray);
+        imshow("Sobel", sobel);
+
+        if (waitKey(30) == 27) { // ESC
+            running = false;
             break;
         }
-        
-        // Read next frame
-        khang_success = khang_cap.read(khang_frame);
-        if(!khang_success){
-            khang_running = false;
+
+        success = cap.read(frame);
+        if (!success) {
+            running = false;
             break;
         }
     }
 
-    // Wait for all threads to finish
-    for (int khang_i = 0; khang_i < khang_num_threads; khang_i++) {
-        pthread_join(khang_threads[khang_i], nullptr);
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], nullptr);
     }
 
-    pthread_barrier_destroy(&khang_barrier);
-    khang_cap.release();
+    pthread_barrier_destroy(&barrier);
+    cap.release();
     destroyAllWindows();
-    
+
     return 0;
 }
 
-void* khang_worker(void* khang_arg) {
-    KhangThreadArgs* khang_thread = (KhangThreadArgs*)khang_arg;
-    
-    while(*(khang_thread->khang_shared->khang_running)) {
-        // Process grayscale
-        khang_to442_grayscale(khang_thread);
-        pthread_barrier_wait(khang_thread->khang_shared->khang_barrier);
-        
-        // Process sobel
-        khang_to442_sobel(khang_thread);
-        pthread_barrier_wait(khang_thread->khang_shared->khang_barrier);
+void* worker(void* arg) {
+    ThreadArgs* thread = static_cast<ThreadArgs*>(arg);
+
+    while (*(thread->shared->running)) {
+        toGrayscale(thread);
+        pthread_barrier_wait(thread->shared->barrier);
+
+        toSobel(thread);
+        pthread_barrier_wait(thread->shared->barrier);
     }
-    
+
     return nullptr;
 }
 
-void khang_to442_grayscale(KhangThreadArgs* khang_thread) {
-    cv::Mat* khang_frame = khang_thread->khang_shared->khang_frame;
-    cv::Mat* khang_gray = khang_thread->khang_shared->khang_gray;
-    
-    uint8_t* khang_src_data = khang_frame->data;
-    uint8_t* khang_dst_data = khang_gray->data;
-    size_t khang_src_stride = khang_frame->step;
-    size_t khang_dst_stride = khang_gray->step;
-    
-    int khang_start_row = khang_thread->khang_thread_id * khang_thread->khang_row_per_thread;
-    int khang_end_row = min(khang_start_row + khang_thread->khang_row_per_thread, khang_thread->khang_shared->khang_rows);
-    
-    for (int khang_y = khang_start_row; khang_y < khang_end_row; khang_y++) {
-        uint8_t* khang_src_row = khang_src_data + khang_y * khang_src_stride;
-        uint8_t* khang_dst_row = khang_dst_data + khang_y * khang_dst_stride;
-        
-        for (int khang_x = 0; khang_x < khang_thread->khang_shared->khang_cols; khang_x++) {
-            uint8_t* khang_src_pixel = khang_src_row + khang_x * khang_thread->khang_shared->khang_channels;
-            
-            uint8_t khang_gray_val = (uint8_t)(
-                0.2126 * khang_src_pixel[2] +  // R
-                0.7152 * khang_src_pixel[1] +  // G
-                0.0722 * khang_src_pixel[0]    // B
-            );
-            
-            khang_dst_row[khang_x] = khang_gray_val;
+void toGrayscale(ThreadArgs* thread) {
+    cv::Mat* frame = thread->shared->frame;
+    cv::Mat* gray  = thread->shared->gray;
+
+    uint8_t* srcData = frame->data;
+    uint8_t* dstData = gray->data;
+    size_t srcStride = frame->step;
+    size_t dstStride = gray->step;
+
+    int startRow = thread->threadId * thread->rowsPerThread;
+    int endRow   = std::min(startRow + thread->rowsPerThread, thread->shared->rows);
+
+    int cols = thread->shared->cols;
+    int channels = thread->shared->channels; // should be 3 for BGR
+
+    // Fixed-point weights (sum to 256)
+    const uint8_t WB = 19;
+    const uint8_t WG = 183;
+    const uint8_t WR = 54;
+
+    for (int y = startRow; y < endRow; y++) {
+        uint8_t* srcRow = srcData + y * srcStride;
+        uint8_t* dstRow = dstData + y * dstStride;
+
+        int x = 0;
+
+        // Process 8 pixels per loop: 8 * 3 = 24 bytes
+        for (; x <= cols - 8; x += 8) {
+            const uint8_t* p = srcRow + x * channels;
+
+            // Load 8 interleaved BGR pixels
+            // bgr.val[0]=B, val[1]=G, val[2]=R
+            uint8x8x3_t bgr = vld3_u8(p);
+
+            // Widen and multiply: (B*WB + G*WG + R*WR)
+            uint16x8_t acc = vmull_n_u8(bgr.val[0], WB);
+            acc = vmlal_n_u8(acc, bgr.val[1], WG);
+            acc = vmlal_n_u8(acc, bgr.val[2], WR);
+
+            // Add rounding offset then shift down by 8
+            acc = vaddq_u16(acc, vdupq_n_u16(128));
+            uint8x8_t out = vshrn_n_u16(acc, 8);
+
+            vst1_u8(dstRow + x, out);
+        }
+
+        // Scalar tail
+        for (; x < cols; x++) {
+            uint8_t* srcPixel = srcRow + x * channels;
+            // BGR order
+            uint16_t b = srcPixel[0];
+            uint16_t g = srcPixel[1];
+            uint16_t r = srcPixel[2];
+
+            uint16_t val = (WB*b + WG*g + WR*r + 128) >> 8;
+            dstRow[x] = (uint8_t)val;
         }
     }
 }
 
-void khang_to442_sobel(KhangThreadArgs* khang_thread) {
-    cv::Mat* khang_image = khang_thread->khang_shared->khang_gray;
-    cv::Mat* khang_filtered_image = khang_thread->khang_shared->khang_sobel;
-    
-    int khang_rows = khang_thread->khang_shared->khang_rows;
-    int khang_cols = khang_thread->khang_shared->khang_cols;
-    
-    uint8_t* khang_data = khang_image->data;
-    size_t khang_stride = khang_image->step;
-    
-    int khang_G_x[3][3] = {
-        {-1, 0, 1},
-        {-2, 0, 2},
-        {-1, 0, 1}
-    };
-    
-    int khang_G_y[3][3] = {
-        { 1,  2,  1},
-        { 0,  0,  0},
-        {-1, -2, -1}
-    };
-    
-    int khang_start_row = khang_thread->khang_thread_id * khang_thread->khang_row_per_thread;
-    int khang_end_row = min(khang_start_row + khang_thread->khang_row_per_thread, khang_rows);
-    
-    for (int khang_y = khang_start_row; khang_y < khang_end_row; khang_y++) {
-        for (int khang_x = 0; khang_x < khang_cols; khang_x++) {
-            int16_t khang_gx = 0;
-            int16_t khang_gy = 0;
-            
-            for (int khang_ky = -1; khang_ky <= 1; khang_ky++) {
-                for (int khang_kx = -1; khang_kx <= 1; khang_kx++) {
-                    int khang_px = khang_x + khang_kx;
-                    int khang_py = khang_y + khang_ky;
-                    
-                    // bounds check
-                    if (khang_px >= 0 && khang_px < khang_cols && khang_py >= 0 && khang_py < khang_rows) {
-                        uint8_t khang_pixel_val = khang_data[khang_py * khang_stride + khang_px];
-                        
-                        khang_gx += khang_pixel_val * khang_G_x[khang_ky + 1][khang_kx + 1];
-                        khang_gy += khang_pixel_val * khang_G_y[khang_ky + 1][khang_kx + 1];
-                    }
-                }
-            }
-            
-            // Gradient magnitude approximation
-            int khang_magnitude = std::abs(khang_gx) + std::abs(khang_gy);
-            
-            // Clamp to 8-bit (0-255)
-            if (khang_magnitude > 255) khang_magnitude = 255;
-            
-            khang_filtered_image->at<uint8_t>(khang_y, khang_x) = (uint8_t)khang_magnitude;
+
+void toSobel(ThreadArgs* thread) {
+    cv::Mat* gray  = thread->shared->gray;
+    cv::Mat* sobel = thread->shared->sobel;
+
+    int rows = thread->shared->rows;
+    int cols = thread->shared->cols;
+
+    uint8_t* src = gray->data;
+    uint8_t* dst = sobel->data;
+    size_t stride = gray->step;
+
+    int startRow = thread->threadId * thread->rowsPerThread;
+    int endRow   = std::min(startRow + thread->rowsPerThread, rows);
+
+    // Clamp to interior rows for vector path
+    int y0 = std::max(startRow, 1);
+    int y1 = std::min(endRow, rows - 1);
+
+    // Optional: clear borders for rows this thread owns
+    // (so we don't leave old pixels there)
+    for (int y = startRow; y < endRow; y++) {
+        if (y == 0 || y == rows - 1) {
+            std::memset(dst + y * stride, 0, cols);
+        } else {
+            dst[y * stride + 0] = 0;
+            dst[y * stride + (cols - 1)] = 0;
+        }
+    }
+
+    for (int y = y0; y < y1; y++) {
+        const uint8_t* row0 = src + (y - 1) * stride;
+        const uint8_t* row1 = src + (y    ) * stride;
+        const uint8_t* row2 = src + (y + 1) * stride;
+
+        uint8_t* outRow = dst + y * stride;
+
+        int x = 1;
+
+        // Need x+8 to be valid when we load starting at (x-1) for vext
+        for (; x <= cols - 9; x += 8) {
+            // Load 16 bytes starting at x-1 (covers x-1 .. x+14)
+            uint8x16_t t0 = vld1q_u8(row0 + x - 1);
+            uint8x16_t t1 = vld1q_u8(row1 + x - 1);
+            uint8x16_t t2 = vld1q_u8(row2 + x - 1);
+
+            // For 8 outputs (x..x+7), we need left/center/right (shift 0/1/2)
+            uint8x8_t tl = vget_low_u8(t0);
+            uint8x8_t tc = vget_low_u8(vextq_u8(t0, t0, 1));
+            uint8x8_t tr = vget_low_u8(vextq_u8(t0, t0, 2));
+
+            uint8x8_t ml = vget_low_u8(t1);
+            uint8x8_t mc = vget_low_u8(vextq_u8(t1, t1, 1));
+            uint8x8_t mr = vget_low_u8(vextq_u8(t1, t1, 2));
+
+            uint8x8_t bl = vget_low_u8(t2);
+            uint8x8_t bc = vget_low_u8(vextq_u8(t2, t2, 1));
+            uint8x8_t br = vget_low_u8(vextq_u8(t2, t2, 2));
+
+            // Gx = (tr - tl) + 2*(mr - ml) + (br - bl)
+            int16x8_t dx_top = vsubl_u8(tr, tl);
+            int16x8_t dx_mid = vsubl_u8(mr, ml);
+            int16x8_t dx_bot = vsubl_u8(br, bl);
+
+            int16x8_t gx = vaddq_s16(vaddq_s16(dx_top, vshlq_n_s16(dx_mid, 1)), dx_bot);
+
+            // Gy = (tl + 2*tc + tr) - (bl + 2*bc + br)
+            uint16x8_t tl16 = vmovl_u8(tl);
+            uint16x8_t tc16 = vmovl_u8(tc);
+            uint16x8_t tr16 = vmovl_u8(tr);
+
+            uint16x8_t bl16 = vmovl_u8(bl);
+            uint16x8_t bc16 = vmovl_u8(bc);
+            uint16x8_t br16 = vmovl_u8(br);
+
+            uint16x8_t top = vaddq_u16(vaddq_u16(tl16, tr16), vshlq_n_u16(tc16, 1));
+            uint16x8_t bot = vaddq_u16(vaddq_u16(bl16, br16), vshlq_n_u16(bc16, 1));
+
+            int16x8_t gy = vsubq_s16(vreinterpretq_s16_u16(top),
+                                     vreinterpretq_s16_u16(bot));
+
+            // magnitude = abs(gx) + abs(gy), saturated to 255
+            uint16x8_t ax = vreinterpretq_u16_s16(vabsq_s16(gx));
+            uint16x8_t ay = vreinterpretq_u16_s16(vabsq_s16(gy));
+            uint16x8_t mag = vqaddq_u16(ax, ay);
+
+            // Narrow with saturation to u8
+            uint8x8_t out = vqmovn_u16(mag);
+
+            vst1_u8(outRow + x, out);
+        }
+
+        // Scalar tail for remaining interior pixels until cols-2
+        for (; x < cols - 1; x++) {
+            int16_t gx = 0, gy = 0;
+
+            uint8_t p00 = row0[x - 1], p01 = row0[x], p02 = row0[x + 1];
+            uint8_t p10 = row1[x - 1],             p12 = row1[x + 1];
+            uint8_t p20 = row2[x - 1], p21 = row2[x], p22 = row2[x + 1];
+
+            gx = (int16_t)(p02 - p00) + (int16_t)2 * (p12 - p10) + (int16_t)(p22 - p20);
+            gy = (int16_t)(p00 + 2*p01 + p02) - (int16_t)(p20 + 2*p21 + p22);
+
+            int mag = std::abs(gx) + std::abs(gy);
+            if (mag > 255) mag = 255;
+            outRow[x] = (uint8_t)mag;
         }
     }
 }

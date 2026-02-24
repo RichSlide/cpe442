@@ -1,0 +1,5 @@
+use _fp16 for grayscale
+pull in vectors of pixels, operate on them, then convert them bacck at the end
+
+To optimize with vectors, do 8 pixels at a time
+ - e.g. grab 8 upper lefts and do math on them at the same time
