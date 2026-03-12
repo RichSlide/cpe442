@@ -331,5 +331,312 @@ static inline void fused_sobel(threadArgs* threadinfo){
 * Function: fnForThread1
 *
 * Description: This function is used by all threads to call appropriate 
+* functions and deal with barriers
+*
+* param arg: is a struct threadArgs passed in as a void * that needs to be 
+* casted for each thread
+*
+* return: void
+-------------------------------------------------------------------------*/
 
+void *fnForThread1(void *arg){
+	threadArgs* threadinfo = (threadArgs*)arg;
+	int tid = threadinfo->threadindex;
 
+	pin_thread_to_core(tid);
+
+	int ret = PAPI_register_thread();
+	if (ret != PAPI_OK) {
+		std::cerr << "PAPI_register_thread failed: " << PAPI_strerror(ret) << "\n";
+		std::exit(1);
+	}
+
+	int EventSet = PAPI_NULL;
+	ret = PAPI_create_eventset(&EventSet);
+	if (ret != PAPI_OK) {
+		std::cerr << "Error creating event set: " << PAPI_strerror(ret) << "\n";
+		exit(1);
+	}
+
+	// attempt to add L1 cache miss counter — soft fail if unavailable
+	bool have_l1dcm = false;
+	ret = PAPI_add_event(EventSet, PAPI_L1_DCM);
+	if (ret == PAPI_OK) {
+		have_l1dcm = true;
+	} else {
+		if (tid == 0)
+			std::cerr << "PAPI L1_DCM unavailable (" << PAPI_strerror(ret)
+			          << ") — miss counts will be 0\n";
+	}
+
+	// attempt to add cycle counter — soft fail if unavailable
+	bool have_cycles = false;
+	int cyc_code = PAPI_NULL;
+	ret = PAPI_event_name_to_code((char*)"perf::PERF_COUNT_HW_CPU_CYCLES", &cyc_code);
+	if (ret == PAPI_OK) {
+		ret = PAPI_add_event(EventSet, cyc_code);
+		if (ret == PAPI_OK) {
+			have_cycles = true;
+		} else {
+			if (tid == 0)
+				std::cerr << "PAPI cycles unavailable (" << PAPI_strerror(ret)
+				          << ") — cycle counts will be 0\n";
+		}
+	}
+
+	// only call PAPI_start/stop if at least one event was added
+	const bool papi_active = have_l1dcm || have_cycles;
+
+	// values[] index depends on which events were added and in what order
+	const int idx_misses = 0;
+	const int idx_cycles = have_l1dcm ? 1 : 0;
+
+	while (!threads_should_stop.load(std::memory_order_acquire)) {
+		pthread_barrier_wait(&barrier_start);
+		if (threads_should_stop.load(std::memory_order_acquire))
+			break;
+
+		if (papi_active) {
+			ret = PAPI_start(EventSet);
+			if (ret != PAPI_OK){
+				std::cerr << "PAPI_start failed: " << PAPI_strerror(ret) << "\n";
+				exit(1);
+			}
+		}
+
+		fused_sobel(threadinfo);
+
+		if (papi_active) {
+			long long values[2] = {0, 0};
+			ret = PAPI_stop(EventSet, values);
+			if (ret != PAPI_OK) {
+				std::cerr << "PAPI_stop failed: " << PAPI_strerror(ret) << "\n";
+				std::exit(1);
+			}
+			if (have_l1dcm)  core_misses[tid].fetch_add(values[idx_misses], std::memory_order_relaxed);
+			if (have_cycles) core_cycles[tid].fetch_add(values[idx_cycles], std::memory_order_relaxed);
+		}
+
+		core_frames[tid].fetch_add(1, std::memory_order_relaxed);
+
+		pthread_barrier_wait(&barrier_done);
+	}
+
+	PAPI_cleanup_eventset(EventSet);
+	PAPI_destroy_eventset(&EventSet);
+
+	ret = PAPI_unregister_thread();
+	if (ret != PAPI_OK) {
+		std::cerr << "PAPI_unregister_thread failed: " << PAPI_strerror(ret) << "\n";
+		std::exit(1);
+	}
+
+	return NULL;
+}
+
+/*-----------------------------------------------------------------------*
+* Function: startThreads
+*
+* Description: helper function to start threads and remove cluter in main
+*
+* return: void
+-------------------------------------------------------------------------*/
+
+void startThreads(){
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	int retVal1 = pthread_create(&thread[0], NULL, fnForThread1, (void *)&targetthread[0]);
+	int retVal2 = pthread_create(&thread[1], NULL, fnForThread1, (void *)&targetthread[1]);
+	int retVal3 = pthread_create(&thread[2], NULL, fnForThread1, (void *)&targetthread[2]);
+	int retVal4 = pthread_create(&thread[3], NULL, fnForThread1, (void *)&targetthread[3]);
+
+	(void)retVal1; (void)retVal2; (void)retVal3; (void)retVal4;
+}
+
+/*-----------------------------------------------------------------------*
+* Function: compute_thread_ranges
+*
+* Description: This function takes a information about the frame and returns
+* the rows each thread will need to compute
+*
+* param rows: number of total rows in frame
+* param num_threads: number of threads we have
+* param ranges: the vector where ranges of rows will be stored 
+* for each thread
+*
+* return: void
+-------------------------------------------------------------------------*/
+
+void compute_thread_ranges(int rows, int num_threads, std::vector<std::pair<int,int>>&ranges){
+	int interior = std::max(0, rows - 2);
+	int base = interior / num_threads;
+	int rem  = interior % num_threads;
+
+	ranges.resize(num_threads);
+	int cur = 1;
+	for (int i = 0; i < num_threads; ++i) {
+		int add = base + (i < rem ? 1 : 0);
+		int y0 = cur; 
+		int y1 = cur + add;
+		if (add == 0) { y0 = y1 = 1; }
+		ranges[i] = { y0, y1 };
+		cur = y1; 
+	}
+}
+
+/*-----------------------------------------------------------------------*
+* Function: main
+*
+* Description: takes a video from the command line and passes it threw
+* a grayscale function and sobel filter function then shows each frame
+* to the user using threading
+*
+* param: argv[1] = Video
+*
+* return: int
+-------------------------------------------------------------------------*/
+
+int main (int argc, char *argv[]){
+	if (argc < 2) return -1;
+
+	cv::VideoCapture cap(argv[1]);
+	if(!cap.isOpened()) return -1;
+
+	cv::Mat frame; // kept for initial setup — workers use frames[] double-buffer
+	if(!cap.read(frame)) return 0;
+
+	cv::Mat sobelMat(frame.rows, frame.cols, CV_8UC1, cv::Scalar(0));
+
+	std::vector<std::pair<int,int>> ranges;
+	compute_thread_ranges(frame.rows, NUM_THREADS, ranges);
+
+	int ret = PAPI_library_init(PAPI_VER_CURRENT);
+	if (ret != PAPI_VER_CURRENT){
+		std::cerr << "PAPI init failed\n";
+		exit(1);
+	}
+
+	ret = PAPI_thread_init((unsigned long (*)(void))(pthread_self));
+	if (ret != PAPI_OK) {
+		std::cerr << "PAPI_thread_init failed: " << PAPI_strerror(ret) << "\n";
+		exit(1);
+	}
+
+	for (int i = 0; i < NUM_THREADS; i++){
+		void* p0 = nullptr;
+		void* p1 = nullptr;
+		void* p2 = nullptr;
+
+		// round up to nearest 64-byte cache line so no row buffer tail
+		// shares a cache line with the next thread's buffer
+		size_t rowbuf_sz = ((size_t)frame.cols + 63) & ~63ULL;
+		if (posix_memalign(&p0, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+		if (posix_memalign(&p1, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+		if (posix_memalign(&p2, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+
+		std::memset(p0, 0, rowbuf_sz);
+		std::memset(p1, 0, rowbuf_sz);
+		std::memset(p2, 0, rowbuf_sz);
+
+		targetthread[i].gray_row0 = (uchar*)p0;
+		targetthread[i].gray_row1 = (uchar*)p1;
+		targetthread[i].gray_row2 = (uchar*)p2;
+	}
+
+	for (int i = 0; i < 4; i++){
+		targetthread[i].rgb = &frame;
+		targetthread[i].sobel = &sobelMat;
+		targetthread[i].y0 = ranges[i].first;
+		targetthread[i].y1 = ranges[i].second;
+		targetthread[i].threadindex = i;
+	}
+
+	pthread_barrier_init(&barrier_start, NULL, 5);
+	pthread_barrier_init(&barrier_done, NULL, 5);
+
+	for (int i = 0; i < NUM_THREADS; i++) {
+		core_misses[i].store(0, std::memory_order_relaxed);
+		core_frames[i].store(0, std::memory_order_relaxed);
+		core_cycles[i].store(0, std::memory_order_relaxed);
+	}
+
+	startThreads();
+
+	// double-buffer: frames[0]/frames[1] alternate so cap.read for frame N+1
+	// overlaps with worker threads processing frame N — decode is now free
+	cv::Mat frames[2];
+	frames[0] = frame;
+	if (!cap.read(frames[1])) frames[1] = frames[0]; // single-frame video fallback
+	int cur = 0;
+
+	auto start_time = std::chrono::high_resolution_clock::now();
+	while (true){
+		cv::Mat& curFrame = frames[cur];
+		int next = 1 - cur;
+
+		std::memset(sobelMat.ptr<uchar>(0), 0, (size_t)curFrame.cols);
+		std::memset(sobelMat.ptr<uchar>(curFrame.rows - 1), 0, (size_t)curFrame.cols);
+
+		// point all workers at the current frame
+		for (int i = 0; i < NUM_THREADS; i++)
+			targetthread[i].rgb = &curFrame;
+
+		pthread_barrier_wait(&barrier_start);
+
+		// decode next frame while workers process current — free overlap
+		bool got_next = cap.read(frames[next]);
+
+		pthread_barrier_wait(&barrier_done);
+
+		cv::imshow("sobel", sobelMat);
+		int key = cv::waitKey(1);
+		if (key == 27 || key == 'q') break;
+
+		if (!got_next) break;
+		cur = next;
+	}
+
+	threads_should_stop.store(true, std::memory_order_release);
+	pthread_barrier_wait(&barrier_start);
+
+	for(int i = 0; i < NUM_THREADS; i++){
+		pthread_join(thread[i], NULL);
+	}
+
+	pthread_barrier_destroy(&barrier_start);
+	pthread_barrier_destroy(&barrier_done);
+
+	auto end_time = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> elapsed = end_time - start_time;
+	double total_seconds = elapsed.count();
+
+	long long total_frames = core_frames[0].load();
+	double fps = (total_seconds > 0.0) ? (double)total_frames / total_seconds : 0.0;
+	std::cout << "FPS:" << fps << "\n";	
+
+	for (int i = 0; i < NUM_THREADS; i++){
+		long long misses = core_misses[i].load();
+		long long cycles = core_cycles[i].load();
+		long long f = core_frames[i].load();
+		double missesPerFrame = (f > 0) ? (double)misses / (double)f : 0.0;
+		double cyclesPerFrame = (f > 0) ? (double)cycles / (double)f : 0.0;
+		std::cout << "Avg misses per frame for core " << i << ": " << missesPerFrame << "\n";
+		std::cout << "Avg cycles per frame for core " << i << ": " << cyclesPerFrame << "\n";
+		std::cout << "Misses: " << misses << "\n";
+		std::cout << "Frames: " << f << "\n";
+	}
+
+	for (int i = 0; i < NUM_THREADS; i++){
+		free(targetthread[i].gray_row0);
+		free(targetthread[i].gray_row1);
+		free(targetthread[i].gray_row2);
+		targetthread[i].gray_row0 = nullptr;
+		targetthread[i].gray_row1 = nullptr;
+		targetthread[i].gray_row2 = nullptr;
+	}
+
+	cap.release();
+	cv::destroyAllWindows();
+	return 0;
+}
