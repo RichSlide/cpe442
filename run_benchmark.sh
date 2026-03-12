@@ -14,7 +14,9 @@
 #   sudo ./run_benchmark.sh --restore
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: deliberately omitting -e so that a segfault in the sobel binary
+# (non-zero exit) does not short-circuit the restore block at the bottom.
 
 # ---------- colour helpers ---------------------------------------------------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -28,8 +30,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ---------- resolve absolute path of this script so --restore works ----------
+# $0 can be a relative path that breaks after a directory change; resolve once
+# at startup so the self-call at the end is always valid.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
 # ---------- binary and restore-state paths -----------------------------------
-SOBEL_BIN="$(dirname "$0")/sobel"
+SOBEL_BIN="$(dirname "$SELF")/sobel"
 STATE_DIR="/tmp/sobel_benchmark_state"
 mkdir -p "$STATE_DIR"
 
@@ -203,10 +210,15 @@ info "  IRQs redirected to core 3 (bitmask 0x8)"
 # 5. DISABLE NMI WATCHDOG
 #    The NMI watchdog fires periodic non-maskable interrupts to detect
 #    kernel hangs. Disabling it eliminates those interruptions entirely.
+#    Not present on all kernels/boards (Pi 5 often omits it) — skip if so.
 # =============================================================================
-info "Disabling NMI watchdog..."
-cat /proc/sys/kernel/nmi_watchdog > "$STATE_DIR/nmi_watchdog"
-echo 0 > /proc/sys/kernel/nmi_watchdog
+if [[ -f /proc/sys/kernel/nmi_watchdog ]]; then
+    info "Disabling NMI watchdog..."
+    cat /proc/sys/kernel/nmi_watchdog > "$STATE_DIR/nmi_watchdog"
+    echo 0 > /proc/sys/kernel/nmi_watchdog
+else
+    warn "NMI watchdog not present on this kernel — skipping"
+fi
 
 # =============================================================================
 # 6. PERF EVENT PARANOID — allow PAPI hardware counters without root
@@ -233,7 +245,7 @@ echo "-----------------------------------------------------------"
 echo "  System state at launch:"
 printf "  CPU governor:      %s\n" "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
 printf "  CPU freq (core 0): %s kHz\n" "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo unknown)"
-printf "  NMI watchdog:      %s\n" "$(cat /proc/sys/kernel/nmi_watchdog)"
+printf "  NMI watchdog:      %s\n" "$([[ -f /proc/sys/kernel/nmi_watchdog ]] && cat /proc/sys/kernel/nmi_watchdog || echo 'not present')"
 printf "  perf_event_paranoid: %s\n" "$(cat /proc/sys/kernel/perf_event_paranoid)"
 printf "  Video file:        %s\n" "$VIDEO_FILE"
 printf "  Display:           %s\n" "$([[ "$EXTRA_ARGS" == "--no-display" ]] && echo no || echo yes)"
@@ -256,14 +268,17 @@ echo ""
 info "Launching sobel at SCHED_FIFO priority 99..."
 echo ""
 
-chrt -f 99 taskset -c 0-3 "$SOBEL_BIN" "$VIDEO_FILE" $EXTRA_ARGS
+chrt -f 99 taskset -c 0-3 "$SOBEL_BIN" "$VIDEO_FILE" ${EXTRA_ARGS:+"$EXTRA_ARGS"}
 EXIT_CODE=$?
 
 # =============================================================================
 # 10. RESTORE AUTOMATICALLY AFTER RUN
 # =============================================================================
 echo ""
-info "Benchmark finished (exit code $EXIT_CODE). Restoring system..."
-"$0" --restore
+if [[ $EXIT_CODE -ne 0 ]]; then
+    warn "Binary exited with code $EXIT_CODE (segfault = 139, check the C++ binary not this script)"
+fi
+info "Restoring system..."
+"$SELF" --restore
 
 exit $EXIT_CODE

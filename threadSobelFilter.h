@@ -26,9 +26,13 @@
 * Pointers to rgb/sobel are shared (read-only rgb, write-only sobel stripe).
 * gray_row{0,1,2} are private per-thread ring buffers — 64-byte aligned,
 * allocated in main before threads are spawned.
+*
+* alignas(64): aligns each element of the targetthread[] array to a 64-byte
+* cache line boundary, preventing false sharing between thread descriptors
+* without any fragile compile-time size arithmetic.
 *------------------------------------------------------------------------*/
 
-struct threadArgs {
+struct alignas(64) threadArgs {
     // shared frame pointers (main thread owns lifetime)
     cv::Mat* rgb;
     cv::Mat* sobel;
@@ -45,18 +49,8 @@ struct threadArgs {
     unsigned char* gray_row1;
     unsigned char* gray_row2;
 
-    // pad to 64 bytes to prevent false sharing between thread descriptors
-    char _pad[64 - (
-        sizeof(cv::Mat*)       // rgb
-      + sizeof(cv::Mat*)       // sobel
-      + sizeof(int)            // y0
-      + sizeof(int)            // y1
-      + sizeof(int)            // threadindex
-      + sizeof(int)            // implicit struct padding
-      + sizeof(unsigned char*) // gray_row0
-      + sizeof(unsigned char*) // gray_row1
-      + sizeof(unsigned char*) // gray_row2
-    ) % 64];
+    // no manual _pad needed — alignas(64) on the struct guarantees each
+    // element of threadArgs[] starts on a fresh cache line automatically.
 };
 
 /*-----------------------------------------------------------------------*
