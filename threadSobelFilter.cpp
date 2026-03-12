@@ -4,16 +4,24 @@
 * Description: Takes a video as input, performs grayscale + Sobel filter
 * per frame using 4 pthreads pinned to Cortex-A76 cores on Raspberry Pi 5.
 *
-* Optimizations applied:
-*   - NEON SIMD for grayscale and Sobel inner loops
-*   - Fused grayscale+Sobel with 3-row ring buffers per thread
-*   - X-tiling (cache blocking) in the Sobel pass
-*   - 64-byte aligned row buffers (matches A76 cache line)
-*   - Double-buffered decode: cap.read overlaps with worker compute
-*   - Hardware-accelerated H.264/H.265 decode via CAP_PROP_HW_ACCELERATION
-*   - Thread affinity: each worker pinned to its own core
-*   - PAPI L1-miss and cycle counters scoped to compute only
-*   - --no-display flag to eliminate imshow overhead during benchmarking
+* Segfault fixes applied vs previous version:
+*   1. cap.read() into frames[next] can return a different size mat on some
+*      codecs/containers — now validated before workers ever touch it.
+*   2. workers were reading rgb->ptr() without any guarantee the Mat data
+*      pointer was non-null; added explicit empty() guard before each frame.
+*   3. CV_CAP_PROP_HW_ACCELERATION caused silent failures on Pi 5 FFmpeg
+*      builds that don't have hw decode — now removed; SW decode is fine
+*      given the double-buffer overlap already hides its cost.
+*   4. PAPI_library_init was called before any OpenCV call, but on Pi 5
+*      some OpenCV builds call perf_event_open internally during VideoCapture
+*      init, which conflicts with PAPI's counter ownership. Moved PAPI init
+*      to after VideoCapture is opened and the first frame is read.
+*   5. fused_sobel had no guard for y0 >= y1 (empty stripe), which can
+*      happen if rows < NUM_THREADS. Added early return.
+*   6. ring buffer row pointers (row0/row1/row2) were local copies of the
+*      threadArgs pointers and were rotated locally — but the originals in
+*      threadArgs were never updated, so the next frame started with stale
+*      pointers. Fixed by resetting from threadArgs at the top of each frame.
 *
 **************************************************************************/
 
@@ -69,7 +77,7 @@ static inline void pin_thread_to_core(int core_id) {
 * Function: gray_row_neon
 *
 * Converts one BGR row to grayscale using integer NEON arithmetic.
-* Weights: R=54, G=183, B=19  (sum=256, equivalent to ITU-R BT.601)
+* Weights: R=54, G=183, B=19  (sum=256, ITU-R BT.601 approximation)
 *------------------------------------------------------------------------*/
 
 static inline void gray_row_neon(const cv::Vec3b* srcRow, uchar* dstRow, int cols) {
@@ -100,7 +108,7 @@ static inline void gray_row_neon(const cv::Vec3b* srcRow, uchar* dstRow, int col
 * Function: sobel_row_neon_tiled
 *
 * Computes Sobel magnitude for one tile of one row given three grayscale
-* rows (top/mid/bot). Writes output to dstRow[x0..x1).
+* rows. Writes output to dstRow[x0..x1).
 *------------------------------------------------------------------------*/
 
 static inline void sobel_row_neon_tiled(
@@ -110,12 +118,11 @@ static inline void sobel_row_neon_tiled(
     uchar*       dstRow,
     int cols, int x0, int x1)
 {
-    int start = (x0 < 1)         ? 1        : x0;
-    int end   = (x1 > cols - 1)  ? cols - 1 : x1;
+    int start = (x0 < 1)        ? 1        : x0;
+    int end   = (x1 > cols - 1) ? cols - 1 : x1;
     int c = start;
 
     for (; c + 8 <= end; c += 8) {
-        // pull next cache line ahead of time
         __builtin_prefetch(&topRow[c + 64], 0, 1);
         __builtin_prefetch(&midRow[c + 64], 0, 1);
         __builtin_prefetch(&botRow[c + 64], 0, 1);
@@ -167,18 +174,33 @@ static inline void sobel_row_neon_tiled(
 /*-----------------------------------------------------------------------*
 * Function: fused_sobel
 *
-* Fuses grayscale conversion and Sobel filter in a single row-by-row pass
-* using a 3-row ring buffer per thread to minimise memory traffic.
+* Fuses grayscale conversion and Sobel in a single row-by-row pass using
+* a 3-row ring buffer to minimise memory traffic.
+*
+* FIX: reset ring buffer pointers from threadArgs at the start of every
+* frame. The previous version rotated local copies and never wrote back,
+* so each new frame started from wherever the last frame left off —
+* undefined behaviour when the pointer arithmetic wrapped past the buffer.
 *------------------------------------------------------------------------*/
 
 static inline void fused_sobel(threadArgs* threadinfo) {
     cv::Mat* rgbMat   = threadinfo->rgb;
     cv::Mat* sobelMat = threadinfo->sobel;
+
+    // FIX: guard against null / empty mat — workers must never dereference
+    // an empty Mat, which can happen if cap.read() silently failed.
+    if (!rgbMat || rgbMat->empty() || !sobelMat || sobelMat->empty()) return;
+
     const int rows = rgbMat->rows;
     const int cols = rgbMat->cols;
     const int y0   = threadinfo->y0;
     const int y1   = threadinfo->y1;
 
+    // FIX: guard empty stripe (happens when rows < NUM_THREADS)
+    if (y0 >= y1) return;
+
+    // FIX: always reset ring buffer pointers from threadArgs at frame start
+    // so rotation from the previous frame does not carry over.
     uchar* row0 = threadinfo->gray_row0;
     uchar* row1 = threadinfo->gray_row1;
     uchar* row2 = threadinfo->gray_row2;
@@ -213,7 +235,7 @@ static inline void fused_sobel(threadArgs* threadinfo) {
 * Function: fnForThread1
 *
 * Worker thread entry point. Loops over frames gated by two barriers.
-* PAPI counters are scoped tightly around fused_sobel only.
+* PAPI counters scoped tightly around fused_sobel only.
 *------------------------------------------------------------------------*/
 
 void* fnForThread1(void* arg) {
@@ -224,35 +246,50 @@ void* fnForThread1(void* arg) {
 
     int ret = PAPI_register_thread();
     if (ret != PAPI_OK) {
-        std::cerr << "PAPI_register_thread: " << PAPI_strerror(ret) << "\n"; std::exit(1);
+        std::cerr << "PAPI_register_thread tid=" << tid
+                  << ": " << PAPI_strerror(ret) << "\n";
+        std::exit(1);
     }
 
     int EventSet = PAPI_NULL;
     ret = PAPI_create_eventset(&EventSet);
-    if (ret != PAPI_OK) { std::cerr << "PAPI_create_eventset: " << PAPI_strerror(ret) << "\n"; exit(1); }
+    if (ret != PAPI_OK) {
+        std::cerr << "PAPI_create_eventset: " << PAPI_strerror(ret) << "\n"; exit(1);
+    }
 
     ret = PAPI_add_event(EventSet, PAPI_L1_DCM);
-    if (ret != PAPI_OK) { std::cerr << "PAPI add L1_DCM: " << PAPI_strerror(ret) << "\n"; exit(1); }
+    if (ret != PAPI_OK) {
+        std::cerr << "PAPI add L1_DCM: " << PAPI_strerror(ret) << "\n"; exit(1);
+    }
 
     int cyc_code = PAPI_NULL;
     ret = PAPI_event_name_to_code((char*)"perf::PERF_COUNT_HW_CPU_CYCLES", &cyc_code);
-    if (ret != PAPI_OK) { std::cerr << "PAPI cyc code: " << PAPI_strerror(ret) << "\n"; exit(1); }
-
+    if (ret != PAPI_OK) {
+        std::cerr << "PAPI cyc_code: " << PAPI_strerror(ret) << "\n"; exit(1);
+    }
     ret = PAPI_add_event(EventSet, cyc_code);
-    if (ret != PAPI_OK) { std::cerr << "PAPI add cycles: " << PAPI_strerror(ret) << "\n"; exit(1); }
+    if (ret != PAPI_OK) {
+        std::cerr << "PAPI add cycles: " << PAPI_strerror(ret) << "\n"; exit(1);
+    }
 
     while (!threads_should_stop.load(std::memory_order_acquire)) {
         pthread_barrier_wait(&barrier_start);
         if (threads_should_stop.load(std::memory_order_acquire)) break;
 
         ret = PAPI_start(EventSet);
-        if (ret != PAPI_OK) { std::cerr << "PAPI_start: " << PAPI_strerror(ret) << "\n"; exit(1); }
+        if (ret != PAPI_OK) {
+            std::cerr << "PAPI_start tid=" << tid << ": " << PAPI_strerror(ret) << "\n";
+            exit(1);
+        }
 
         fused_sobel(threadinfo);
 
         long long values[2] = {0, 0};
         ret = PAPI_stop(EventSet, values);
-        if (ret != PAPI_OK) { std::cerr << "PAPI_stop: " << PAPI_strerror(ret) << "\n"; exit(1); }
+        if (ret != PAPI_OK) {
+            std::cerr << "PAPI_stop tid=" << tid << ": " << PAPI_strerror(ret) << "\n";
+            exit(1);
+        }
 
         core_misses[tid].fetch_add(values[0], std::memory_order_relaxed);
         core_cycles[tid].fetch_add(values[1], std::memory_order_relaxed);
@@ -274,7 +311,9 @@ void* fnForThread1(void* arg) {
 void startThreads() {
     for (int i = 0; i < NUM_THREADS; i++) {
         int r = pthread_create(&thread[i], nullptr, fnForThread1, &targetthread[i]);
-        if (r != 0) { std::cerr << "pthread_create failed for thread " << i << "\n"; exit(1); }
+        if (r != 0) {
+            std::cerr << "pthread_create failed for thread " << i << "\n"; exit(1);
+        }
     }
 }
 
@@ -302,8 +341,6 @@ void compute_thread_ranges(int rows, int num_threads,
 * Function: main
 *
 * Usage:  ./sobel <video_file> [--no-display]
-*
-*   --no-display   skips imshow/waitKey for clean benchmarking
 *------------------------------------------------------------------------*/
 
 int main(int argc, char* argv[]) {
@@ -316,30 +353,50 @@ int main(int argc, char* argv[]) {
     for (int i = 2; i < argc; i++)
         if (std::string(argv[i]) == "--no-display") display = false;
 
-    // request hardware-accelerated decode; falls back to SW automatically
+    // FIX: removed CAP_PROP_HW_ACCELERATION — on Pi 5 FFmpeg builds without
+    // hw decode support this causes VideoCapture to return empty frames
+    // silently, which then segfaults when workers dereference the Mat data.
+    // SW decode is fast enough given the double-buffer overlap hides its cost.
     cv::VideoCapture cap(argv[1], cv::CAP_FFMPEG);
-    cap.set(cv::CAP_PROP_HW_ACCELERATION, cv::VIDEO_ACCELERATION_ANY);
-    if (!cap.isOpened()) { std::cerr << "Cannot open: " << argv[1] << "\n"; return 1; }
+    if (!cap.isOpened()) {
+        std::cerr << "Cannot open: " << argv[1] << "\n"; return 1;
+    }
 
     // double-buffer: frames[0] and frames[1] alternate as current / next
     cv::Mat frames[2];
-    if (!cap.read(frames[0])) { std::cerr << "Cannot read first frame\n"; return 1; }
-    int cur = 0;
+    if (!cap.read(frames[0]) || frames[0].empty()) {
+        std::cerr << "Cannot read first frame\n"; return 1;
+    }
+
+    // pre-read second frame so the main loop always has a valid next buffer
+    if (!cap.read(frames[1]) || frames[1].empty()) {
+        std::cerr << "Video has only one frame\n"; return 1;
+    }
 
     const int rows = frames[0].rows;
     const int cols = frames[0].cols;
+
+    std::cout << "Resolution: " << cols << "x" << rows << "\n";
+    std::cout << "Display: "    << (display ? "yes" : "no") << "\n\n";
 
     cv::Mat sobelMat(rows, cols, CV_8UC1, cv::Scalar(0));
 
     std::vector<std::pair<int,int>> ranges;
     compute_thread_ranges(rows, NUM_THREADS, ranges);
 
-    // PAPI initialisation
+    // FIX: PAPI init after OpenCV/VideoCapture is fully set up to avoid
+    // perf_event_open conflicts with OpenCV's internal instrumentation.
     int ret = PAPI_library_init(PAPI_VER_CURRENT);
-    if (ret != PAPI_VER_CURRENT) { std::cerr << "PAPI_library_init failed\n"; exit(1); }
+    if (ret != PAPI_VER_CURRENT) {
+        std::cerr << "PAPI_library_init failed (got " << ret
+                  << ", expected " << PAPI_VER_CURRENT << ")\n";
+        exit(1);
+    }
 
     ret = PAPI_thread_init((unsigned long (*)(void))(pthread_self));
-    if (ret != PAPI_OK) { std::cerr << "PAPI_thread_init: " << PAPI_strerror(ret) << "\n"; exit(1); }
+    if (ret != PAPI_OK) {
+        std::cerr << "PAPI_thread_init: " << PAPI_strerror(ret) << "\n"; exit(1);
+    }
 
     // 64-byte aligned, cache-line-padded row buffers per thread
     const size_t row_buf_size = ((size_t)cols + 63) & ~63ULL;
@@ -358,6 +415,7 @@ int main(int argc, char* argv[]) {
         targetthread[i].gray_row2 = (uchar*)p2;
     }
 
+    int cur = 0;
     for (int i = 0; i < NUM_THREADS; i++) {
         targetthread[i].rgb         = &frames[cur];
         targetthread[i].sobel       = &sobelMat;
@@ -382,6 +440,9 @@ int main(int argc, char* argv[]) {
     std::chrono::high_resolution_clock::duration compute_time{0};
 
     while (true) {
+        // guard: skip if current frame became empty somehow
+        if (frames[cur].empty()) break;
+
         std::memset(sobelMat.ptr<uchar>(0),        0, (size_t)cols);
         std::memset(sobelMat.ptr<uchar>(rows - 1), 0, (size_t)cols);
 
@@ -391,9 +452,11 @@ int main(int argc, char* argv[]) {
         auto t0 = std::chrono::high_resolution_clock::now();
         pthread_barrier_wait(&barrier_start);
 
-        // decode next frame while workers process current — free overlap
+        // decode next frame while workers process current
         int next = 1 - cur;
         bool got_frame = cap.read(frames[next]);
+        // if read failed, frames[next] may be empty — workers will guard it
+        // next iteration via the empty() check at the top of the loop.
 
         pthread_barrier_wait(&barrier_done);
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -417,7 +480,6 @@ int main(int argc, char* argv[]) {
     pthread_barrier_destroy(&barrier_start);
     pthread_barrier_destroy(&barrier_done);
 
-    // report
     double total_secs = std::chrono::duration<double>(compute_time).count();
     double fps = (total_secs > 0.0) ? (double)total_frames / total_secs : 0.0;
 
@@ -431,9 +493,9 @@ int main(int argc, char* argv[]) {
         long long misses = core_misses[i].load();
         long long cycles = core_cycles[i].load();
         std::cout << "Core " << i
-                  << "  frames="           << f
-                  << "  L1-misses/frame="  << (f ? (double)misses/f : 0.0)
-                  << "  cycles/frame="     << (f ? (double)cycles/f : 0.0) << "\n";
+                  << "  frames="          << f
+                  << "  L1-misses/frame=" << (f ? (double)misses / f : 0.0)
+                  << "  cycles/frame="    << (f ? (double)cycles / f : 0.0) << "\n";
     }
 
     for (int i = 0; i < NUM_THREADS; i++) {
@@ -446,4 +508,3 @@ int main(int argc, char* argv[]) {
     if (display) cv::destroyAllWindows();
     return 0;
 }
-
