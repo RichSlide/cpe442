@@ -129,9 +129,77 @@ static inline void sobel_row_neon_tiled(
 
 	int c = start;
 
-	// vectorized interior for this tile
+	// 16-wide NEON: process 16 pixels per iteration using 128-bit q-registers
+	// This halves the loop overhead vs the previous 8-wide version.
+	for (; c + 16 <= end; c += 16){
+		// prefetch the next 64-byte cache line for all three rows
+		__builtin_prefetch(&topRow[c + 64], 0, 1);
+		__builtin_prefetch(&midRow[c + 64], 0, 1);
+		__builtin_prefetch(&botRow[c + 64], 0, 1);
+
+		uint8x16_t tL8 = vld1q_u8(&topRow[c-1]);
+		uint8x16_t tC8 = vld1q_u8(&topRow[c]);
+		uint8x16_t tR8 = vld1q_u8(&topRow[c+1]);
+
+		uint8x16_t mL8 = vld1q_u8(&midRow[c-1]);
+		uint8x16_t mR8 = vld1q_u8(&midRow[c+1]);
+
+		uint8x16_t bL8 = vld1q_u8(&botRow[c-1]);
+		uint8x16_t bC8 = vld1q_u8(&botRow[c]);
+		uint8x16_t bR8 = vld1q_u8(&botRow[c+1]);
+
+		// split each 16-wide vector into low/high 8-wide halves, widen to s16
+		// low halves
+		int16x8_t tL_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(tL8)));
+		int16x8_t tC_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(tC8)));
+		int16x8_t tR_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(tR8)));
+		int16x8_t mL_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mL8)));
+		int16x8_t mR_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mR8)));
+		int16x8_t bL_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bL8)));
+		int16x8_t bC_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bC8)));
+		int16x8_t bR_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(bR8)));
+
+		// high halves
+		int16x8_t tL_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(tL8)));
+		int16x8_t tC_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(tC8)));
+		int16x8_t tR_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(tR8)));
+		int16x8_t mL_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mL8)));
+		int16x8_t mR_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mR8)));
+		int16x8_t bL_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(bL8)));
+		int16x8_t bC_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(bC8)));
+		int16x8_t bR_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(bR8)));
+
+		// gx low
+		int16x8_t gx_lo = vsubq_s16(
+			vaddq_s16(vaddq_s16(tR_lo, bR_lo), vshlq_n_s16(mR_lo, 1)),
+			vaddq_s16(vaddq_s16(tL_lo, bL_lo), vshlq_n_s16(mL_lo, 1)));
+		// gy low
+		int16x8_t gy_lo = vsubq_s16(
+			vaddq_s16(vaddq_s16(tL_lo, tR_lo), vshlq_n_s16(tC_lo, 1)),
+			vaddq_s16(vaddq_s16(bL_lo, bR_lo), vshlq_n_s16(bC_lo, 1)));
+
+		// gx high
+		int16x8_t gx_hi = vsubq_s16(
+			vaddq_s16(vaddq_s16(tR_hi, bR_hi), vshlq_n_s16(mR_hi, 1)),
+			vaddq_s16(vaddq_s16(tL_hi, bL_hi), vshlq_n_s16(mL_hi, 1)));
+		// gy high
+		int16x8_t gy_hi = vsubq_s16(
+			vaddq_s16(vaddq_s16(tL_hi, tR_hi), vshlq_n_s16(tC_hi, 1)),
+			vaddq_s16(vaddq_s16(bL_hi, bR_hi), vshlq_n_s16(bC_hi, 1)));
+
+		// |gx|+|gy| with saturation, recombine low+high into 16 bytes
+		uint8x8_t out_lo = vqmovn_u16(vaddq_u16(
+			vreinterpretq_u16_s16(vabsq_s16(gx_lo)),
+			vreinterpretq_u16_s16(vabsq_s16(gy_lo))));
+		uint8x8_t out_hi = vqmovn_u16(vaddq_u16(
+			vreinterpretq_u16_s16(vabsq_s16(gx_hi)),
+			vreinterpretq_u16_s16(vabsq_s16(gy_hi))));
+
+		vst1q_u8(&dstRow[c], vcombine_u8(out_lo, out_hi));
+	}
+
+	// 8-wide cleanup for columns that don't fill a 16-wide group
 	for (; c + 8 <= end; c += 8){
-		// load 3 columns (left, center, right) from each of the 3 rows
 		uint8x8_t tL8 = vld1_u8(&topRow[c-1]);
 		uint8x8_t tC8 = vld1_u8(&topRow[c]);
 		uint8x8_t tR8 = vld1_u8(&topRow[c+1]);
@@ -178,7 +246,7 @@ static inline void sobel_row_neon_tiled(
 		vst1_u8(&dstRow[c], out);
 	}
 
-	// scalar remainder for this tile
+	// scalar remainder
 	for (; c < end; ++c) {
 		int tL = topRow[c-1],  tC = topRow[c],  tR = topRow[c+1];
 		int mL = midRow[c-1],                mR = midRow[c+1];
@@ -435,7 +503,7 @@ int main (int argc, char *argv[]){
 	cv::VideoCapture cap(argv[1]);
 	if(!cap.isOpened()) return -1;
 
-	cv::Mat frame;
+	cv::Mat frame; // kept for initial setup — workers use frames[] double-buffer
 	if(!cap.read(frame)) return 0;
 
 	cv::Mat sobelMat(frame.rows, frame.cols, CV_8UC1, cv::Scalar(0));
@@ -460,13 +528,16 @@ int main (int argc, char *argv[]){
 		void* p1 = nullptr;
 		void* p2 = nullptr;
 
-		if (posix_memalign(&p0, 16, (size_t)frame.cols) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
-		if (posix_memalign(&p1, 16, (size_t)frame.cols) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
-		if (posix_memalign(&p2, 16, (size_t)frame.cols) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+		// round up to nearest 64-byte cache line so no row buffer tail
+		// shares a cache line with the next thread's buffer
+		size_t rowbuf_sz = ((size_t)frame.cols + 63) & ~63ULL;
+		if (posix_memalign(&p0, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+		if (posix_memalign(&p1, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
+		if (posix_memalign(&p2, 64, rowbuf_sz) != 0) { std::cerr << "posix_memalign failed\n"; exit(1); }
 
-		std::memset(p0, 0, (size_t)frame.cols);
-		std::memset(p1, 0, (size_t)frame.cols);
-		std::memset(p2, 0, (size_t)frame.cols);
+		std::memset(p0, 0, rowbuf_sz);
+		std::memset(p1, 0, rowbuf_sz);
+		std::memset(p2, 0, rowbuf_sz);
 
 		targetthread[i].gray_row0 = (uchar*)p0;
 		targetthread[i].gray_row1 = (uchar*)p1;
@@ -492,19 +563,38 @@ int main (int argc, char *argv[]){
 
 	startThreads();
 
+	// double-buffer: frames[0]/frames[1] alternate so cap.read for frame N+1
+	// overlaps with worker threads processing frame N — decode is now free
+	cv::Mat frames[2];
+	frames[0] = frame;
+	if (!cap.read(frames[1])) frames[1] = frames[0]; // single-frame video fallback
+	int cur = 0;
+
 	auto start_time = std::chrono::high_resolution_clock::now();
 	while (true){
-		std::memset(sobelMat.ptr<uchar>(0), 0, (size_t)frame.cols);
-		std::memset(sobelMat.ptr<uchar>(frame.rows - 1), 0, (size_t)frame.cols);
+		cv::Mat& curFrame = frames[cur];
+		int next = 1 - cur;
+
+		std::memset(sobelMat.ptr<uchar>(0), 0, (size_t)curFrame.cols);
+		std::memset(sobelMat.ptr<uchar>(curFrame.rows - 1), 0, (size_t)curFrame.cols);
+
+		// point all workers at the current frame
+		for (int i = 0; i < NUM_THREADS; i++)
+			targetthread[i].rgb = &curFrame;
 
 		pthread_barrier_wait(&barrier_start);
+
+		// decode next frame while workers process current — free overlap
+		bool got_next = cap.read(frames[next]);
+
 		pthread_barrier_wait(&barrier_done);
 
 		cv::imshow("sobel", sobelMat);
 		int key = cv::waitKey(1);
 		if (key == 27 || key == 'q') break;
 
-		if(!cap.read(frame)) break;
+		if (!got_next) break;
+		cur = next;
 	}
 
 	threads_should_stop.store(true, std::memory_order_release);
